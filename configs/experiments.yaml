@@ -1,0 +1,187 @@
+# Experiment Configurations for Benchmarking
+# Each experiment tests a specific combination of features that affect SQL generation.
+#
+# Common settings applied to all experiments:
+#   experiment_id: "checkout-layout"
+#   start_date: "2021-11-03T00:00:00"
+#   end_date: "2022-02-01T00:00:00"
+#   variations: ["0", "1", "2"]
+#   exposure_table: "viewed_experiment"
+#   default_conversion_window_hours: 72
+
+defaults:
+  experiment_id: "checkout-layout"
+  start_date: "2021-11-03T00:00:00"
+  end_date: "2022-02-01T00:00:00"
+  variations: ["0", "1", "2"]
+  exposure_table: "viewed_experiment"
+  conversion_window_hours: 72
+
+experiments:
+  # === BASE ===
+  - id: base
+    attribution: first_exposure
+
+  # === ATTRIBUTION MODEL ===
+  - id: base_allExposures
+    attribution: experiment_duration
+
+  # === SKIP PARTIAL DATA ===
+  - id: skipPartialData
+    attribution: first_exposure
+    skip_partial_data: true
+
+  # === ACTIVATION METRICS ===
+  - id: activation
+    attribution: first_exposure
+    activation:
+      event_name: "Cart Loaded"
+      source_table: events
+      user_id_column: user_id
+      timestamp_column: timestamp
+
+  - id: activation_anonymous
+    attribution: first_exposure
+    activation:
+      event_name: "Cart Loaded"
+      source_table: events
+      user_id_column: anonymous_id
+      timestamp_column: timestamp
+      # Requires identity join (anonymous_id -> user_id)
+      identity_join:
+        table: orders
+        from_column: anonymous_id
+        to_column: user_id
+
+  - id: activation_allExposures
+    attribution: experiment_duration
+    activation:
+      event_name: "Cart Loaded"
+      source_table: events
+      user_id_column: user_id
+      timestamp_column: timestamp
+
+  # === NEGATIVE CONVERSION DELAY (pre-exposure events) ===
+  - id: negativeconversion
+    attribution: first_exposure
+    conversion_window_hours: 48
+    delay_hours: -24
+
+  - id: base_allExposures_negativeconversion
+    attribution: experiment_duration
+    conversion_window_hours: 48
+    delay_hours: -24
+
+  - id: activation_negativeconversion
+    attribution: first_exposure
+    conversion_window_hours: 48
+    delay_hours: -24
+    activation:
+      event_name: "Cart Loaded"
+      source_table: events
+      user_id_column: user_id
+      timestamp_column: timestamp
+
+  - id: activation_allExposures_negativeconversion
+    attribution: experiment_duration
+    conversion_window_hours: 48
+    delay_hours: -24
+    activation:
+      event_name: "Cart Loaded"
+      source_table: events
+      user_id_column: user_id
+      timestamp_column: timestamp
+
+  # === POSITIVE CONVERSION DELAY (skip initial period) ===
+  - id: positiveconversion
+    attribution: first_exposure
+    conversion_window_hours: 48
+    delay_hours: 24
+
+  - id: base_allExposures_positiveconversion
+    attribution: experiment_duration
+    conversion_window_hours: 48
+    delay_hours: 24
+
+  - id: activation_positiveconversion
+    attribution: first_exposure
+    conversion_window_hours: 48
+    delay_hours: 24
+    activation:
+      event_name: "Cart Loaded"
+      source_table: events
+      user_id_column: user_id
+      timestamp_column: timestamp
+
+  - id: activation_allExposures_positiveconversion
+    attribution: experiment_duration
+    conversion_window_hours: 48
+    delay_hours: 24
+    activation:
+      event_name: "Cart Loaded"
+      source_table: events
+      user_id_column: user_id
+      timestamp_column: timestamp
+
+  # === LOOKBACK WINDOW (events in last N hours of experiment) ===
+  - id: lookback
+    attribution: first_exposure
+    window_type: lookback
+    conversion_window_hours: 48
+    delay_hours: 24
+
+  - id: lookback_allExposures
+    attribution: experiment_duration
+    window_type: lookback
+    conversion_window_hours: 48
+    delay_hours: 24
+
+  - id: lookback_skipPartial
+    attribution: experiment_duration
+    window_type: lookback
+    conversion_window_hours: 48
+    delay_hours: 24
+    skip_partial_data: true
+
+  # === DIMENSIONS (break down results by a categorical variable) ===
+  - id: dimension_date
+    attribution: first_exposure
+    dimension:
+      type: date
+      # Groups by DATE(first_exposure_timestamp)
+
+  - id: dimension_experiment
+    attribution: first_exposure
+    dimension:
+      type: exposure_field
+      field: browser
+      # Groups by the browser column from the exposure table
+
+  - id: dimension_user
+    attribution: first_exposure
+    dimension:
+      type: user_attribute
+      table: orders
+      user_id_column: user_id
+      value_column: country
+      # Groups by user's country from a separate table
+
+  - id: dimension_activation
+    attribution: first_exposure
+    activation:
+      event_name: "Cart Loaded"
+      source_table: events
+      user_id_column: user_id
+      timestamp_column: timestamp
+    dimension:
+      type: activation
+      # Groups by "Activated" vs "Not Activated"
+
+  # === SEGMENTS (filter to a user subpopulation) ===
+  - id: filter_segment
+    attribution: first_exposure
+    segment:
+      table: viewed_experiment
+      filter: "browser = 'Chrome'"
+      user_id_column: user_id
+      date_column: timestamp

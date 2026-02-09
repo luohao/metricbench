@@ -1,0 +1,516 @@
+# Metric Definitions for Benchmarking
+# Each metric defines how to compute a value per user within a conversion window.
+#
+# Types:
+#   binomial  - 0 or 1 per user (did event happen?)
+#   count     - numeric value summed per user
+#   ratio     - numerator / denominator (stats engine computes delta method CI)
+#   quantile  - Nth percentile of event-level values
+#
+# Special features:
+#   cuped              - regression adjustment using pre-exposure period
+#   capping            - percentile cap on per-user totals
+#   custom_aggregation - override default SUM with COUNT(*), COUNT(DISTINCT), etc.
+
+metrics:
+  # =========================================================================
+  # BINOMIAL METRICS (0 or 1 per user)
+  # =========================================================================
+
+  - id: any_item_in_cart
+    type: binomial
+    source_table: events
+    filter: "event = 'Add to Cart'"
+    user_id_column: user_id
+    timestamp_column: timestamp
+    # Pre-agg mapping
+    preagg_column: has_add_to_cart
+    preagg_agg: max
+
+  - id: any_item_in_cart_cuped
+    type: binomial
+    source_table: events
+    filter: "event = 'Add to Cart'"
+    user_id_column: user_id
+    timestamp_column: timestamp
+    cuped:
+      enabled: true
+      pre_period_days: 4
+    preagg_column: has_add_to_cart
+    preagg_agg: max
+
+  # =========================================================================
+  # COUNT METRICS (numeric value per user)
+  # =========================================================================
+
+  - id: purchased_items
+    type: count
+    source_table: orders
+    value_column: qty
+    user_id_column: user_id
+    timestamp_column: timestamp
+    aggregation: SUM
+    preagg_column: purchased_items
+    preagg_agg: sum
+
+  - id: purchased_items_anonymous
+    type: count
+    source_table: orders
+    value_column: qty
+    user_id_column: anonymous_id
+    timestamp_column: timestamp
+    aggregation: SUM
+    # Requires identity join to map anonymous_id -> user_id
+    identity_join:
+      table: orders
+      from_column: anonymous_id
+      to_column: user_id
+    preagg_column: purchased_items
+    preagg_agg: sum
+
+  - id: purchased_items_custom_agg
+    type: count
+    source_table: orders
+    value_column: qty
+    user_id_column: user_id
+    timestamp_column: timestamp
+    aggregation: "COUNT(*)"
+    preagg_column: purchase_count
+    preagg_agg: sum
+
+  - id: purchased_items_custom_agg_cuped
+    type: count
+    source_table: orders
+    value_column: qty
+    user_id_column: user_id
+    timestamp_column: timestamp
+    aggregation: "COUNT(*)"
+    cuped:
+      enabled: true
+      pre_period_days: 4
+    preagg_column: purchase_count
+    preagg_agg: sum
+
+  - id: purchased_value
+    type: count
+    source_table: orders
+    value_column: amount
+    user_id_column: user_id
+    timestamp_column: timestamp
+    aggregation: SUM
+    ignore_nulls: false
+    preagg_column: purchased_value
+    preagg_agg: sum
+
+  - id: purchased_value_pctilecap
+    type: count
+    source_table: orders
+    value_column: amount
+    user_id_column: user_id
+    timestamp_column: timestamp
+    aggregation: SUM
+    ignore_nulls: false
+    capping:
+      type: percentile
+      value: 0.9
+      ignore_zeros: false
+    preagg_column: purchased_value
+    preagg_agg: sum
+
+  - id: purchased_value_pctilecap_ignorezeros
+    type: count
+    source_table: orders
+    value_column: amount
+    user_id_column: user_id
+    timestamp_column: timestamp
+    aggregation: SUM
+    ignore_nulls: false
+    capping:
+      type: percentile
+      value: 0.9
+      ignore_zeros: true
+    preagg_column: purchased_value
+    preagg_agg: sum
+
+  - id: count_distinct_date
+    type: count
+    source_table: orders
+    value_column: "CAST(timestamp AS DATE)"
+    user_id_column: user_id
+    timestamp_column: timestamp
+    aggregation: "COUNT(DISTINCT value)"
+    preagg_column: has_activity
+    preagg_agg: count_rows  # count of daily rows = count distinct dates
+
+  - id: purchased_items_cuped
+    type: count
+    source_table: orders
+    value_column: qty
+    user_id_column: user_id
+    timestamp_column: timestamp
+    aggregation: SUM
+    cuped:
+      enabled: true
+      pre_period_days: 4
+    preagg_column: purchased_items
+    preagg_agg: sum
+
+  - id: purchased_value_cuped
+    type: count
+    source_table: orders
+    value_column: amount
+    user_id_column: user_id
+    timestamp_column: timestamp
+    aggregation: SUM
+    ignore_nulls: false
+    cuped:
+      enabled: true
+      pre_period_days: 4
+    preagg_column: purchased_value
+    preagg_agg: sum
+
+  # =========================================================================
+  # RATIO METRICS (numerator / denominator)
+  # =========================================================================
+
+  - id: ratio_purchase_over_cart
+    type: ratio
+    numerator:
+      source_table: orders
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: binomial
+      preagg_column: has_purchase
+      preagg_agg: max
+    denominator:
+      source_table: events
+      filter: "event = 'Add to Cart'"
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: binomial
+      preagg_column: has_add_to_cart
+      preagg_agg: max
+
+  - id: ratio_revenue_over_cart
+    type: ratio
+    numerator:
+      source_table: orders
+      value_column: amount
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: count
+      aggregation: SUM
+      preagg_column: purchased_value
+      preagg_agg: sum
+    denominator:
+      source_table: events
+      filter: "event = 'Add to Cart'"
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: binomial
+      preagg_column: has_add_to_cart
+      preagg_agg: max
+
+  - id: ratio_revenue_over_items
+    type: ratio
+    numerator:
+      source_table: orders
+      value_column: amount
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: count
+      aggregation: SUM
+      preagg_column: purchased_value
+      preagg_agg: sum
+    denominator:
+      source_table: orders
+      value_column: qty
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: count
+      aggregation: SUM
+      preagg_column: purchased_items
+      preagg_agg: sum
+
+  - id: ratio_large_purchase_over_purchase_over_cart
+    type: ratio
+    # Chained ratio: large_purchase / (any_purchase / any_cart)
+    # Stats engine resolves the chain; SQL just returns 3 columns
+    numerator:
+      source_table: orders
+      filter: "amount >= 10"
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: binomial
+      preagg_column: has_large_purchase
+      preagg_agg: max
+    denominator:
+      source_table: orders
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: binomial
+      preagg_column: has_purchase
+      preagg_agg: max
+
+  - id: ratio_revenue_over_revenue_pctilecap
+    type: ratio
+    numerator:
+      source_table: orders
+      value_column: amount
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: count
+      aggregation: SUM
+      preagg_column: purchased_value
+      preagg_agg: sum
+    denominator:
+      source_table: orders
+      value_column: amount
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: count
+      aggregation: SUM
+      capping:
+        type: percentile
+        value: 0.9
+      preagg_column: purchased_value
+      preagg_agg: sum
+
+  - id: ratio_revenue_over_items_custom
+    type: ratio
+    numerator:
+      source_table: orders
+      value_column: amount
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: count
+      aggregation: "COUNT(*)"
+      preagg_column: purchase_count
+      preagg_agg: sum
+    denominator:
+      source_table: orders
+      value_column: qty
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: count
+      aggregation: "COUNT(*)"
+      preagg_column: purchase_count
+      preagg_agg: sum
+
+  # =========================================================================
+  # FACT METRICS (mean, proportion, ratio from fact tables)
+  # =========================================================================
+
+  - id: fact_purchased_items
+    type: count
+    source_table: orders
+    value_column: qty
+    user_id_column: user_id
+    timestamp_column: timestamp
+    aggregation: SUM
+    preagg_column: purchased_items
+    preagg_agg: sum
+
+  - id: fact_purchased_items_cuped
+    type: count
+    source_table: orders
+    value_column: qty
+    user_id_column: user_id
+    timestamp_column: timestamp
+    aggregation: SUM
+    cuped:
+      enabled: true
+      pre_period_days: 4
+    preagg_column: purchased_items
+    preagg_agg: sum
+
+  - id: fact_purchased_value
+    type: count
+    source_table: orders
+    value_column: amount
+    user_id_column: user_id
+    timestamp_column: timestamp
+    aggregation: SUM
+    ignore_nulls: false
+    preagg_column: purchased_value
+    preagg_agg: sum
+
+  - id: fact_purchased_value_cuped
+    type: count
+    source_table: orders
+    value_column: amount
+    user_id_column: user_id
+    timestamp_column: timestamp
+    aggregation: SUM
+    ignore_nulls: false
+    cuped:
+      enabled: true
+      pre_period_days: 4
+    preagg_column: purchased_value
+    preagg_agg: sum
+
+  - id: fact_purchased_value_pctilecap
+    type: count
+    source_table: orders
+    value_column: amount
+    user_id_column: user_id
+    timestamp_column: timestamp
+    aggregation: SUM
+    ignore_nulls: false
+    capping:
+      type: percentile
+      value: 0.9
+    preagg_column: purchased_value
+    preagg_agg: sum
+
+  - id: fact_purchased_value_pctilecap_ignorezeros
+    type: count
+    source_table: orders
+    value_column: amount
+    user_id_column: user_id
+    timestamp_column: timestamp
+    aggregation: SUM
+    ignore_nulls: false
+    capping:
+      type: percentile
+      value: 0.9
+      ignore_zeros: true
+    preagg_column: purchased_value
+    preagg_agg: sum
+
+  - id: fact_any_item_in_cart
+    type: binomial
+    source_table: events
+    filter: "event = 'Add to Cart'"
+    user_id_column: user_id
+    timestamp_column: timestamp
+    preagg_column: has_add_to_cart
+    preagg_agg: max
+
+  - id: fact_any_item_in_cart_cuped
+    type: binomial
+    source_table: events
+    filter: "event = 'Add to Cart'"
+    user_id_column: user_id
+    timestamp_column: timestamp
+    cuped:
+      enabled: true
+      pre_period_days: 4
+    preagg_column: has_add_to_cart
+    preagg_agg: max
+
+  - id: fact_ratio_purchase_over_cart
+    type: ratio
+    numerator:
+      source_table: orders
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: binomial
+      preagg_column: has_purchase
+      preagg_agg: max
+    denominator:
+      source_table: events
+      filter: "event = 'Add to Cart'"
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: binomial
+      preagg_column: has_add_to_cart
+      preagg_agg: max
+
+  - id: fact_ratio_revenue_over_cart
+    type: ratio
+    numerator:
+      source_table: orders
+      value_column: amount
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: count
+      aggregation: SUM
+      preagg_column: purchased_value
+      preagg_agg: sum
+    denominator:
+      source_table: events
+      filter: "event = 'Add to Cart'"
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: binomial
+      preagg_column: has_add_to_cart
+      preagg_agg: max
+
+  - id: fact_ratio_revenue_over_items
+    type: ratio
+    numerator:
+      source_table: orders
+      value_column: amount
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: count
+      aggregation: SUM
+      preagg_column: purchased_value
+      preagg_agg: sum
+    denominator:
+      source_table: orders
+      value_column: qty
+      user_id_column: user_id
+      timestamp_column: timestamp
+      metric_type: count
+      aggregation: SUM
+      preagg_column: purchased_items
+      preagg_agg: sum
+
+  # =========================================================================
+  # QUANTILE METRICS (Nth percentile of event-level values)
+  # These require data sketches for pre-aggregation
+  # =========================================================================
+
+  - id: quantile_purchased_value_event_p90
+    type: quantile
+    source_table: orders
+    value_column: amount
+    user_id_column: user_id
+    timestamp_column: timestamp
+    quantile_settings:
+      quantile: 0.9
+      quantile_type: event     # percentile across all events
+      ignore_zeros: false
+    preagg_sketch_column: amount_values       # array column
+    preagg_tdigest_column: amount_digest      # tdigest column
+
+  - id: quantile_purchased_value_unit_p90
+    type: quantile
+    source_table: orders
+    value_column: amount
+    user_id_column: user_id
+    timestamp_column: timestamp
+    quantile_settings:
+      quantile: 0.9
+      quantile_type: unit      # percentile across per-user sums
+      ignore_zeros: false
+    preagg_sketch_column: amount_values
+    preagg_tdigest_column: amount_digest
+
+  - id: quantile_purchased_value_event_p90_ignorezeros
+    type: quantile
+    source_table: orders
+    value_column: amount
+    user_id_column: user_id
+    timestamp_column: timestamp
+    quantile_settings:
+      quantile: 0.9
+      quantile_type: event
+      ignore_zeros: true
+    preagg_sketch_column: amount_values_nonzero
+    preagg_tdigest_column: amount_digest_nonzero
+
+  - id: quantile_purchased_value_unit_p90_ignorezeros
+    type: quantile
+    source_table: orders
+    value_column: amount
+    user_id_column: user_id
+    timestamp_column: timestamp
+    quantile_settings:
+      quantile: 0.9
+      quantile_type: unit
+      ignore_zeros: true
+    preagg_sketch_column: amount_values_nonzero
+    preagg_tdigest_column: amount_digest_nonzero

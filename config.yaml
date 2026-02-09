@@ -1,0 +1,28 @@
+# Database connection settings
+# Copy this file to config.local.yaml and edit for your environment
+
+# Default engine (duckdb or postgres)
+engine: duckdb
+
+duckdb:
+  database: /tmp/experimentation-benchmark/benchmark.duckdb
+
+postgres:
+  host: localhost
+  port: 5432
+  database: experimentation_benchmark
+  user: postgres
+  password: ""
+
+# Data generation settings
+data:
+  user_count: 5000
+  run_length_days: 120
+  output_dir: /tmp/experimentation-benchmark/csv
+
+# Benchmark settings
+benchmark:
+  output_dir: /tmp/experimentation-benchmark/results
+  warmup_runs: 1
+  timed_runs: 3
+  use_tdigest: false  # set true if pg_tdigest extension is installed

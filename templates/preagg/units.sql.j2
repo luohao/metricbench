@@ -1,0 +1,58 @@
+{# Pre-agg: Build experiment units from shared_exposures table #}
+{# Much lighter than on-demand -- reads pre-aggregated exposure table #}
+
+{% if segment %}
+__segment AS (
+  SELECT DISTINCT
+    {{ segment.user_id_column }} AS user_id,
+    CAST({{ segment.date_column }} AS DATE) AS date
+  FROM {{ segment.table }}
+  WHERE {{ segment.filter }}
+),
+{% endif %}
+
+{% if dimension and dimension.type == 'user_attribute' %}
+__dimUser AS (
+  SELECT DISTINCT
+    {{ dimension.user_id_column }} AS user_id,
+    {{ dimension.value_column }} AS dim_value
+  FROM {{ dimension.table }}
+),
+{% endif %}
+
+__units AS (
+  SELECT
+    e.user_id AS user_id,
+    CASE
+      WHEN COUNT(DISTINCT e.variation_id) > 1 THEN '__multiple__'
+      ELSE MAX(e.variation_id)
+    END AS variation,
+    MIN(e.first_exposure_timestamp) AS first_exposure
+    {% if dimension and dimension.type == 'exposure_field' %}
+    , MIN(e.{{ dimension.field }}) AS dim_value
+    {% endif %}
+    {% if dimension and dimension.type == 'user_attribute' %}
+    , MIN(d.dim_value) AS dim_value
+    {% endif %}
+    {% if activation %}
+    , MIN(a.first_activation_timestamp) AS first_activation
+    {% endif %}
+  FROM shared_exposures e
+  {% if segment %}
+  JOIN __segment s ON (s.user_id = e.user_id AND s.date <= e.exposure_date)
+  {% endif %}
+  {% if dimension and dimension.type == 'user_attribute' %}
+  LEFT JOIN __dimUser d ON (d.user_id = e.user_id)
+  {% endif %}
+  {% if activation %}
+  LEFT JOIN shared_activations a ON (
+    a.user_id = e.user_id
+    AND a.activation_date >= e.exposure_date
+    AND a.activation_date <= e.exposure_date + {{ (conversion_window_hours / 24) | int }}
+  )
+  {% endif %}
+  WHERE e.experiment_id = '{{ experiment_id }}'
+    AND e.exposure_date >= '{{ start_date }}'::date
+    AND e.exposure_date <= '{{ end_date }}'::date
+  GROUP BY e.user_id
+)

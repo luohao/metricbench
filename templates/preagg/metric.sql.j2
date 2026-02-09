@@ -1,0 +1,348 @@
+{# Pre-agg: Complete metric query from shared daily tables #}
+{# This is the full query for a single experiment x metric combination #}
+
+WITH
+{{ units_cte }}
+
+{% if metric.type == 'ratio' %}
+{# --- RATIO METRIC from pre-aggregated tables --- #}
+
+, __userNumerator AS (
+  SELECT
+    u.user_id,
+    u.variation,
+    {% if metric.numerator.metric_type == 'binomial' %}
+    MAX(COALESCE(m.{{ metric.numerator.preagg_column }}, 0)) AS value
+    {% elif metric.numerator.preagg_agg == 'count_rows' %}
+    COUNT(m.{{ metric.numerator.preagg_column }}) AS value
+    {% else %}
+    COALESCE(SUM(
+      m.{{ metric.numerator.preagg_column }}
+      {% if weighted %}
+      * CASE
+          WHEN m.metric_date = CAST(u.first_exposure AS DATE)
+          THEN (24.0 - EXTRACT(HOUR FROM u.first_exposure)) / 24.0
+          ELSE 1.0
+        END
+      {% endif %}
+    ), 0) AS value
+    {% endif %}
+  FROM __units u
+  LEFT JOIN shared_metrics_daily m
+    ON m.user_id = u.user_id
+    AND {{ preagg_window_clause }}
+  WHERE u.variation != '__multiple__'
+  {% if activation and not dimension_is_activation %}
+    AND u.first_activation IS NOT NULL
+  {% endif %}
+  {% if skip_partial_data %}
+    AND u.first_exposure <= '{{ end_date }}'
+  {% endif %}
+  GROUP BY u.user_id, u.variation
+)
+
+, __userDenominator AS (
+  SELECT
+    u.user_id,
+    u.variation,
+    {% if metric.denominator.metric_type == 'binomial' %}
+    MAX(COALESCE(m.{{ metric.denominator.preagg_column }}, 0)) AS value
+    {% elif metric.denominator.preagg_agg == 'count_rows' %}
+    COUNT(m.{{ metric.denominator.preagg_column }}) AS value
+    {% else %}
+    COALESCE(SUM(
+      m.{{ metric.denominator.preagg_column }}
+      {% if weighted %}
+      * CASE
+          WHEN m.metric_date = CAST(u.first_exposure AS DATE)
+          THEN (24.0 - EXTRACT(HOUR FROM u.first_exposure)) / 24.0
+          ELSE 1.0
+        END
+      {% endif %}
+    ), 0) AS value
+    {% endif %}
+  FROM __units u
+  LEFT JOIN shared_metrics_daily m
+    ON m.user_id = u.user_id
+    AND {{ preagg_window_clause }}
+  WHERE u.variation != '__multiple__'
+  {% if activation and not dimension_is_activation %}
+    AND u.first_activation IS NOT NULL
+  {% endif %}
+  GROUP BY u.user_id, u.variation
+)
+
+SELECT
+  n.variation,
+  COUNT(*) AS users,
+  SUM(n.value) AS main_sum,
+  SUM(POWER(n.value, 2)) AS main_sum_squares,
+  SUM(d.value) AS denominator_sum,
+  SUM(POWER(d.value, 2)) AS denominator_sum_squares,
+  SUM(n.value * d.value) AS main_denominator_sum_product
+FROM __userNumerator n
+JOIN __userDenominator d ON d.user_id = n.user_id AND d.variation = n.variation
+GROUP BY n.variation;
+
+{% elif metric.type == 'quantile' %}
+{# --- QUANTILE METRIC from sketch tables --- #}
+
+{% if use_tdigest %}
+{# Postgres T-digest approach (requires pg_tdigest extension) #}
+, __quantileResult AS (
+  SELECT
+    u.variation,
+    tdigest_percentile(
+      tdigest_union_agg(s.{{ metric.preagg_tdigest_column }}),
+      {{ metric.quantile_settings.quantile }}
+    ) AS quantile_value,
+    COUNT(*) AS user_count
+  FROM __units u
+  JOIN shared_sketches_tdigest s
+    ON s.user_id = u.user_id
+    AND {{ preagg_window_clause_sketch }}
+  WHERE u.variation != '__multiple__'
+  {% if activation and not dimension_is_activation %}
+    AND u.first_activation IS NOT NULL
+  {% endif %}
+  GROUP BY u.variation
+)
+
+SELECT variation, quantile_value, user_count AS users
+FROM __quantileResult;
+
+{% elif use_approx_quantile %}
+{# DuckDB approximate quantile approach (built-in T-Digest, no extension needed) #}
+{% if metric.quantile_settings.quantile_type == 'event' %}
+, __allEvents AS (
+  SELECT
+    u.variation,
+    UNNEST(s.{{ metric.preagg_sketch_column }}) AS event_value
+  FROM __units u
+  JOIN shared_sketches_array s
+    ON s.user_id = u.user_id
+    AND {{ preagg_window_clause_sketch }}
+  WHERE u.variation != '__multiple__'
+  {% if activation and not dimension_is_activation %}
+    AND u.first_activation IS NOT NULL
+  {% endif %}
+)
+
+SELECT
+  variation,
+  approx_quantile(event_value, {{ metric.quantile_settings.quantile }}) AS quantile_value,
+  COUNT(*) AS event_count
+FROM __allEvents
+WHERE event_value IS NOT NULL
+GROUP BY variation;
+
+{% else %}
+{# Unit-level: sum arrays per user, then approx percentile of sums #}
+, __userSums AS (
+  SELECT
+    u.user_id,
+    u.variation,
+    COALESCE((
+      SELECT SUM(v)
+      FROM UNNEST(s.{{ metric.preagg_sketch_column }}) AS t(v)
+    ), 0) AS user_total
+  FROM __units u
+  LEFT JOIN shared_sketches_array s
+    ON s.user_id = u.user_id
+    AND {{ preagg_window_clause_sketch }}
+  WHERE u.variation != '__multiple__'
+  {% if activation and not dimension_is_activation %}
+    AND u.first_activation IS NOT NULL
+  {% endif %}
+)
+
+SELECT
+  variation,
+  approx_quantile(user_total, {{ metric.quantile_settings.quantile }}) AS quantile_value,
+  COUNT(*) AS users
+FROM __userSums
+GROUP BY variation;
+{% endif %}
+
+{% else %}
+{# Exact array approach (works on all engines) #}
+{% if metric.quantile_settings.quantile_type == 'event' %}
+, __allEvents AS (
+  SELECT
+    u.variation,
+    UNNEST(s.{{ metric.preagg_sketch_column }}) AS event_value
+  FROM __units u
+  JOIN shared_sketches_array s
+    ON s.user_id = u.user_id
+    AND {{ preagg_window_clause_sketch }}
+  WHERE u.variation != '__multiple__'
+  {% if activation and not dimension_is_activation %}
+    AND u.first_activation IS NOT NULL
+  {% endif %}
+)
+
+SELECT
+  variation,
+  PERCENTILE_CONT({{ metric.quantile_settings.quantile }})
+    WITHIN GROUP (ORDER BY event_value) AS quantile_value,
+  COUNT(*) AS event_count
+FROM __allEvents
+WHERE event_value IS NOT NULL
+GROUP BY variation;
+
+{% else %}
+{# Unit-level: sum arrays per user, then percentile of sums #}
+, __userSums AS (
+  SELECT
+    u.user_id,
+    u.variation,
+    COALESCE((
+      SELECT SUM(v)
+      FROM UNNEST(s.{{ metric.preagg_sketch_column }}) AS t(v)
+    ), 0) AS user_total
+  FROM __units u
+  LEFT JOIN shared_sketches_array s
+    ON s.user_id = u.user_id
+    AND {{ preagg_window_clause_sketch }}
+  WHERE u.variation != '__multiple__'
+  {% if activation and not dimension_is_activation %}
+    AND u.first_activation IS NOT NULL
+  {% endif %}
+)
+
+SELECT
+  variation,
+  PERCENTILE_CONT({{ metric.quantile_settings.quantile }})
+    WITHIN GROUP (ORDER BY user_total) AS quantile_value,
+  COUNT(*) AS users
+FROM __userSums
+GROUP BY variation;
+{% endif %}
+{% endif %}
+
+{% else %}
+{# --- STANDARD METRIC (binomial or count) from pre-aggregated tables --- #}
+
+, __userMetric AS (
+  SELECT
+    u.user_id,
+    u.variation,
+    {% if dimension and dimension.type == 'date' %}
+    CAST(u.first_exposure AS DATE) AS dim_value,
+    {% elif dimension and dimension.type == 'activation' %}
+    CASE WHEN u.first_activation IS NOT NULL THEN 'Activated' ELSE 'Not Activated' END AS dim_value,
+    {% elif dimension %}
+    u.dim_value,
+    {% endif %}
+    {% if metric.type == 'binomial' %}
+    MAX(COALESCE(m.{{ metric.preagg_column }}, 0)) AS value
+    {% elif metric.preagg_agg == 'count_rows' %}
+    COUNT(m.{{ metric.preagg_column }}) AS value
+    {% else %}
+    COALESCE(SUM(
+      m.{{ metric.preagg_column }}
+      {% if weighted %}
+      * CASE
+          WHEN m.metric_date = CAST(u.first_exposure AS DATE)
+          THEN (24.0 - EXTRACT(HOUR FROM u.first_exposure)) / 24.0
+          ELSE 1.0
+        END
+      {% endif %}
+    ), 0) AS value
+    {% endif %}
+  FROM __units u
+  LEFT JOIN shared_metrics_daily m
+    ON m.user_id = u.user_id
+    AND {{ preagg_window_clause }}
+  WHERE u.variation != '__multiple__'
+  {% if activation and not dimension_is_activation %}
+    AND u.first_activation IS NOT NULL
+  {% endif %}
+  {% if skip_partial_data %}
+    AND u.first_exposure <= '{{ end_date }}'
+  {% endif %}
+  GROUP BY u.user_id, u.variation
+    {% if dimension and dimension.type == 'date' %}
+    , CAST(u.first_exposure AS DATE)
+    {% elif dimension and dimension.type == 'activation' %}
+    , CASE WHEN u.first_activation IS NOT NULL THEN 'Activated' ELSE 'Not Activated' END
+    {% elif dimension %}
+    , u.dim_value
+    {% endif %}
+)
+
+{% if cuped %}
+{# --- CUPED: pre-period from daily aggregates --- #}
+, __userCovariate AS (
+  SELECT
+    u.user_id,
+    {% if metric.type == 'binomial' %}
+    MAX(COALESCE(m.{{ metric.preagg_column }}, 0)) AS covariate_value
+    {% else %}
+    COALESCE(SUM(m.{{ metric.preagg_column }}), 0) AS covariate_value
+    {% endif %}
+  FROM __units u
+  LEFT JOIN shared_metrics_daily m
+    ON m.user_id = u.user_id
+    AND m.metric_date >= CAST(u.first_exposure - INTERVAL '{{ cuped.pre_period_days }} days' AS DATE)
+    AND m.metric_date < CAST(u.first_exposure AS DATE)
+  WHERE u.variation != '__multiple__'
+  {% if activation and not dimension_is_activation %}
+    AND u.first_activation IS NOT NULL
+  {% endif %}
+  GROUP BY u.user_id
+)
+
+SELECT
+  um.variation,
+  {% if dimension %}
+  um.dim_value AS dimension,
+  {% endif %}
+  COUNT(*) AS users,
+  SUM(um.value) AS main_sum,
+  SUM(POWER(um.value, 2)) AS main_sum_squares,
+  SUM(COALESCE(uc.covariate_value, 0)) AS covariate_sum,
+  SUM(POWER(COALESCE(uc.covariate_value, 0), 2)) AS covariate_sum_squares,
+  SUM(um.value * COALESCE(uc.covariate_value, 0)) AS main_covariate_sum_product
+FROM __userMetric um
+LEFT JOIN __userCovariate uc ON uc.user_id = um.user_id
+GROUP BY um.variation {% if dimension %}, um.dim_value {% endif %};
+
+{% elif capping %}
+{# --- PERCENTILE CAPPING from daily aggregates --- #}
+, __capThreshold AS (
+  SELECT
+    PERCENTILE_CONT({{ capping.value }}) WITHIN GROUP (ORDER BY value) AS cap_value
+  FROM __userMetric
+  {% if capping.ignore_zeros %}
+  WHERE value != 0
+  {% endif %}
+)
+
+SELECT
+  um.variation,
+  {% if dimension %}
+  um.dim_value AS dimension,
+  {% endif %}
+  COUNT(*) AS users,
+  SUM(LEAST(um.value, ct.cap_value)) AS main_sum,
+  SUM(POWER(LEAST(um.value, ct.cap_value), 2)) AS main_sum_squares
+FROM __userMetric um
+CROSS JOIN __capThreshold ct
+GROUP BY um.variation {% if dimension %}, um.dim_value {% endif %};
+
+{% else %}
+{# --- STANDARD OUTPUT --- #}
+SELECT
+  variation,
+  {% if dimension %}
+  dim_value AS dimension,
+  {% endif %}
+  COUNT(*) AS users,
+  SUM(value) AS main_sum,
+  SUM(POWER(value, 2)) AS main_sum_squares
+FROM __userMetric
+GROUP BY variation {% if dimension %}, dim_value {% endif %};
+{% endif %}
+
+{% endif %}

@@ -1,0 +1,304 @@
+{# On-demand: Complete metric query scanning raw tables #}
+{# This is the full query for a single experiment x metric combination #}
+
+WITH
+{{ units_cte }}
+
+{% if metric.type == 'ratio' %}
+{# --- RATIO METRIC: compute numerator and denominator separately --- #}
+
+, __metricNumerator AS (
+  SELECT
+    {{ metric.numerator.user_id_column }} AS user_id,
+    {{ metric.numerator.timestamp_column }} AS timestamp
+    {% if metric.numerator.metric_type == 'count' %}
+    , {{ metric.numerator.value_column }} AS value
+    {% endif %}
+  FROM {{ metric.numerator.source_table }}
+  {% if metric.numerator.filter %}
+  WHERE {{ metric.numerator.filter }}
+  {% endif %}
+)
+
+, __metricDenominator AS (
+  SELECT
+    {{ metric.denominator.user_id_column }} AS user_id,
+    {{ metric.denominator.timestamp_column }} AS timestamp
+    {% if metric.denominator.metric_type == 'count' %}
+    , {{ metric.denominator.value_column }} AS value
+    {% endif %}
+  FROM {{ metric.denominator.source_table }}
+  {% if metric.denominator.filter %}
+  WHERE {{ metric.denominator.filter }}
+  {% endif %}
+)
+
+, __userNumerator AS (
+  SELECT
+    u.user_id,
+    u.variation,
+    {% if metric.numerator.metric_type == 'binomial' %}
+    MAX(CASE WHEN {{ conversion_window_clause('u', 'm') }} THEN 1 ELSE 0 END) AS value
+    {% else %}
+    COALESCE({{ metric.numerator.aggregation | default('SUM') }}(
+      CASE WHEN {{ conversion_window_clause('u', 'm') }} THEN m.value ELSE NULL END
+    ), 0) AS value
+    {% endif %}
+  FROM __experimentUnits u
+  LEFT JOIN __metricNumerator m ON m.user_id = u.user_id
+  WHERE u.variation != '__multiple__'
+  {% if activation and not dimension_is_activation %}
+    AND u.first_activation_timestamp IS NOT NULL
+  {% endif %}
+  {% if skip_partial_data %}
+    AND u.first_exposure_timestamp <= '{{ end_date }}'
+  {% endif %}
+  GROUP BY u.user_id, u.variation
+)
+
+, __userDenominator AS (
+  SELECT
+    u.user_id,
+    u.variation,
+    {% if metric.denominator.metric_type == 'binomial' %}
+    MAX(CASE WHEN {{ conversion_window_clause('u', 'm') }} THEN 1 ELSE 0 END) AS value
+    {% else %}
+    COALESCE({{ metric.denominator.aggregation | default('SUM') }}(
+      CASE WHEN {{ conversion_window_clause('u', 'm') }} THEN m.value ELSE NULL END
+    ), 0) AS value
+    {% endif %}
+  FROM __experimentUnits u
+  LEFT JOIN __metricDenominator m ON m.user_id = u.user_id
+  WHERE u.variation != '__multiple__'
+  {% if activation and not dimension_is_activation %}
+    AND u.first_activation_timestamp IS NOT NULL
+  {% endif %}
+  GROUP BY u.user_id, u.variation
+)
+
+SELECT
+  n.variation,
+  {% if dimension %}
+  n.dim_value AS dimension,
+  {% endif %}
+  COUNT(*) AS users,
+  SUM(n.value) AS main_sum,
+  SUM(POWER(n.value, 2)) AS main_sum_squares,
+  SUM(d.value) AS denominator_sum,
+  SUM(POWER(d.value, 2)) AS denominator_sum_squares,
+  SUM(n.value * d.value) AS main_denominator_sum_product
+FROM __userNumerator n
+JOIN __userDenominator d ON d.user_id = n.user_id AND d.variation = n.variation
+GROUP BY n.variation {% if dimension %}, n.dim_value {% endif %};
+
+{% elif metric.type == 'quantile' %}
+{# --- QUANTILE METRIC: need event-level data --- #}
+
+, __metricData AS (
+  SELECT
+    {{ metric.user_id_column }} AS user_id,
+    {{ metric.timestamp_column }} AS timestamp,
+    {{ metric.value_column }} AS value
+  FROM {{ metric.source_table }}
+  {% if metric.quantile_settings.ignore_zeros %}
+  WHERE {{ metric.value_column }} IS NOT NULL AND {{ metric.value_column }} != 0
+  {% else %}
+  WHERE {{ metric.value_column }} IS NOT NULL
+  {% endif %}
+)
+
+{% if metric.quantile_settings.quantile_type == 'event' %}
+, __filteredEvents AS (
+  SELECT
+    u.variation,
+    m.value
+  FROM __experimentUnits u
+  JOIN __metricData m ON m.user_id = u.user_id
+  WHERE u.variation != '__multiple__'
+    AND {{ conversion_window_clause('u', 'm') }}
+  {% if activation and not dimension_is_activation %}
+    AND u.first_activation_timestamp IS NOT NULL
+  {% endif %}
+)
+
+SELECT
+  variation,
+  PERCENTILE_CONT({{ metric.quantile_settings.quantile }})
+    WITHIN GROUP (ORDER BY value) AS quantile_value,
+  COUNT(*) AS event_count
+FROM __filteredEvents
+GROUP BY variation;
+
+{% else %}
+{# unit-level quantile: compute per-user sum, then percentile of sums #}
+, __userMetric AS (
+  SELECT
+    u.user_id,
+    u.variation,
+    SUM(CASE WHEN {{ conversion_window_clause('u', 'm') }} THEN m.value ELSE 0 END) AS value
+  FROM __experimentUnits u
+  LEFT JOIN __metricData m ON m.user_id = u.user_id
+  WHERE u.variation != '__multiple__'
+  {% if activation and not dimension_is_activation %}
+    AND u.first_activation_timestamp IS NOT NULL
+  {% endif %}
+  GROUP BY u.user_id, u.variation
+)
+
+SELECT
+  variation,
+  PERCENTILE_CONT({{ metric.quantile_settings.quantile }})
+    WITHIN GROUP (ORDER BY value) AS quantile_value,
+  COUNT(*) AS users
+FROM __userMetric
+GROUP BY variation;
+{% endif %}
+
+{% else %}
+{# --- STANDARD METRIC (binomial or count) --- #}
+
+, __metricData AS (
+  SELECT
+    {% if metric.identity_join %}
+    j.user_id,
+    m_raw.timestamp,
+    m_raw.value
+  FROM (
+    SELECT {{ metric.user_id_column }} AS join_id, timestamp
+    {% if metric.type == 'count' %}, {{ metric.value_column }} AS value {% endif %}
+    FROM {{ metric.source_table }}
+    {% if metric.filter %} WHERE {{ metric.filter }} {% endif %}
+  ) m_raw
+  JOIN __identityJoin j ON j.{{ metric.identity_join.from_column }} = m_raw.join_id
+    {% else %}
+    {{ metric.user_id_column }} AS user_id,
+    {{ metric.timestamp_column }} AS timestamp
+    {% if metric.type == 'count' %}, {{ metric.value_column }} AS value {% endif %}
+  FROM {{ metric.source_table }}
+  {% if metric.filter %}
+  WHERE {{ metric.filter }}
+  {% endif %}
+    {% endif %}
+)
+
+, __userMetric AS (
+  SELECT
+    u.user_id,
+    u.variation,
+    {% if dimension and dimension.type == 'date' %}
+    CAST(u.first_exposure_timestamp AS DATE) AS dim_value,
+    {% elif dimension and dimension.type == 'activation' %}
+    CASE WHEN u.first_activation_timestamp IS NOT NULL THEN 'Activated' ELSE 'Not Activated' END AS dim_value,
+    {% elif dimension %}
+    u.dim_value,
+    {% endif %}
+    {% if metric.type == 'binomial' %}
+    MAX(CASE WHEN {{ conversion_window_clause('u', 'm') }} THEN 1 ELSE 0 END) AS value
+    {% elif metric.aggregation and metric.aggregation != 'SUM' %}
+    COALESCE({{ metric.aggregation }}(
+      CASE WHEN {{ conversion_window_clause('u', 'm') }} THEN m.value ELSE NULL END
+    ), 0) AS value
+    {% else %}
+    COALESCE(SUM(
+      CASE WHEN {{ conversion_window_clause('u', 'm') }} THEN m.value ELSE NULL END
+    ), 0) AS value
+    {% endif %}
+  FROM __experimentUnits u
+  LEFT JOIN __metricData m ON m.user_id = u.user_id
+  WHERE u.variation != '__multiple__'
+  {% if activation and not dimension_is_activation %}
+    AND u.first_activation_timestamp IS NOT NULL
+  {% endif %}
+  {% if skip_partial_data %}
+    AND u.first_exposure_timestamp <= '{{ end_date }}'
+  {% endif %}
+  GROUP BY u.user_id, u.variation
+    {% if dimension and dimension.type == 'date' %}
+    , CAST(u.first_exposure_timestamp AS DATE)
+    {% elif dimension and dimension.type == 'activation' %}
+    , CASE WHEN u.first_activation_timestamp IS NOT NULL THEN 'Activated' ELSE 'Not Activated' END
+    {% elif dimension %}
+    , u.dim_value
+    {% endif %}
+)
+
+{% if cuped %}
+{# --- CUPED: add pre-period covariate --- #}
+, __userCovariate AS (
+  SELECT
+    u.user_id,
+    {% if metric.type == 'binomial' %}
+    MAX(CASE
+      WHEN m.timestamp >= u.first_exposure_timestamp - INTERVAL '{{ cuped.pre_period_days }} days'
+       AND m.timestamp < u.first_exposure_timestamp
+      THEN 1 ELSE 0
+    END) AS covariate_value
+    {% else %}
+    COALESCE(SUM(CASE
+      WHEN m.timestamp >= u.first_exposure_timestamp - INTERVAL '{{ cuped.pre_period_days }} days'
+       AND m.timestamp < u.first_exposure_timestamp
+      THEN m.value ELSE NULL
+    END), 0) AS covariate_value
+    {% endif %}
+  FROM __experimentUnits u
+  LEFT JOIN __metricData m ON m.user_id = u.user_id
+  WHERE u.variation != '__multiple__'
+  {% if activation and not dimension_is_activation %}
+    AND u.first_activation_timestamp IS NOT NULL
+  {% endif %}
+  GROUP BY u.user_id
+)
+
+SELECT
+  um.variation,
+  {% if dimension %}
+  um.dim_value AS dimension,
+  {% endif %}
+  COUNT(*) AS users,
+  SUM(um.value) AS main_sum,
+  SUM(POWER(um.value, 2)) AS main_sum_squares,
+  SUM(COALESCE(uc.covariate_value, 0)) AS covariate_sum,
+  SUM(POWER(COALESCE(uc.covariate_value, 0), 2)) AS covariate_sum_squares,
+  SUM(um.value * COALESCE(uc.covariate_value, 0)) AS main_covariate_sum_product
+FROM __userMetric um
+LEFT JOIN __userCovariate uc ON uc.user_id = um.user_id
+GROUP BY um.variation {% if dimension %}, um.dim_value {% endif %};
+
+{% elif capping %}
+{# --- PERCENTILE CAPPING --- #}
+, __capThreshold AS (
+  SELECT
+    PERCENTILE_CONT({{ capping.value }}) WITHIN GROUP (ORDER BY value) AS cap_value
+  FROM __userMetric
+  {% if capping.ignore_zeros %}
+  WHERE value != 0
+  {% endif %}
+)
+
+SELECT
+  um.variation,
+  {% if dimension %}
+  um.dim_value AS dimension,
+  {% endif %}
+  COUNT(*) AS users,
+  SUM(LEAST(um.value, ct.cap_value)) AS main_sum,
+  SUM(POWER(LEAST(um.value, ct.cap_value), 2)) AS main_sum_squares
+FROM __userMetric um
+CROSS JOIN __capThreshold ct
+GROUP BY um.variation {% if dimension %}, um.dim_value {% endif %};
+
+{% else %}
+{# --- STANDARD OUTPUT --- #}
+SELECT
+  variation,
+  {% if dimension %}
+  dim_value AS dimension,
+  {% endif %}
+  COUNT(*) AS users,
+  SUM(value) AS main_sum,
+  SUM(POWER(value, 2)) AS main_sum_squares
+FROM __userMetric
+GROUP BY variation {% if dimension %}, dim_value {% endif %};
+{% endif %}
+
+{% endif %}

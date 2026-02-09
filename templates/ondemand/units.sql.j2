@@ -1,0 +1,109 @@
+{# On-demand: Build experiment units from raw exposure table #}
+{# One CTE per experiment, scanning raw viewed_experiment each time #}
+
+{% if identity_join %}
+__identityJoin AS (
+  SELECT DISTINCT
+    {{ identity_join.to_column }} AS user_id,
+    {{ identity_join.from_column }} AS {{ identity_join.from_column }}
+  FROM {{ identity_join.table }}
+),
+{% endif %}
+
+__rawExperiment AS (
+  SELECT
+    user_id,
+    timestamp,
+    CAST(variation_id AS VARCHAR) AS variation_id,
+    browser,
+    country
+  FROM {{ exposure_table }}
+  WHERE experiment_id = '{{ experiment_id }}'
+    AND timestamp >= '{{ start_date }}'
+    AND timestamp <= '{{ end_date }}'
+),
+
+{% if activation %}
+__activationMetric AS (
+  SELECT
+    {% if activation.identity_join %}
+    j.user_id,
+    {% else %}
+    {{ activation.user_id_column }} AS user_id,
+    {% endif %}
+    {% if activation.identity_join %}
+    a.timestamp
+    {% else %}
+    timestamp
+    {% endif %}
+  FROM
+    {% if activation.identity_join %}
+    (SELECT {{ activation.user_id_column }}, timestamp FROM {{ activation.source_table }} WHERE event = '{{ activation.event_name }}') a
+    JOIN __identityJoin j ON j.{{ activation.identity_join.from_column }} = a.{{ activation.user_id_column }}
+    {% else %}
+    {{ activation.source_table }}
+    WHERE event = '{{ activation.event_name }}'
+      AND timestamp >= '{{ start_date }}'
+      AND timestamp <= '{{ activation_end_date }}'
+    {% endif %}
+),
+{% endif %}
+
+{% if segment %}
+__segment AS (
+  SELECT DISTINCT
+    {{ segment.user_id_column }} AS user_id,
+    CAST({{ segment.date_column }} AS DATE) AS date
+  FROM {{ segment.table }}
+  WHERE {{ segment.filter }}
+),
+{% endif %}
+
+{% if dimension and dimension.type == 'user_attribute' %}
+__dimUser AS (
+  SELECT DISTINCT
+    {{ dimension.user_id_column }} AS user_id,
+    {{ dimension.value_column }} AS dim_value
+  FROM {{ dimension.table }}
+),
+{% endif %}
+
+__experimentUnits AS (
+  SELECT
+    e.user_id AS user_id,
+    CASE
+      WHEN COUNT(DISTINCT e.variation_id) > 1 THEN '__multiple__'
+      ELSE MAX(e.variation_id)
+    END AS variation,
+    MIN(e.timestamp) AS first_exposure_timestamp
+    {% if dimension and dimension.type == 'exposure_field' %}
+    , MIN(e.{{ dimension.field }}) AS dim_value
+    {% endif %}
+    {% if dimension and dimension.type == 'user_attribute' %}
+    , MIN(d.dim_value) AS dim_value
+    {% endif %}
+    {% if activation %}
+    , MIN(
+        CASE
+          WHEN a.timestamp >= e.timestamp
+           AND a.timestamp <= e.timestamp + INTERVAL '{{ conversion_window_hours }} hours'
+          THEN a.timestamp
+          ELSE NULL
+        END
+      ) AS first_activation_timestamp
+    {% endif %}
+  FROM __rawExperiment e
+  {% if segment %}
+  JOIN __segment s ON (s.user_id = e.user_id)
+  {% endif %}
+  {% if dimension and dimension.type == 'user_attribute' %}
+  LEFT JOIN __dimUser d ON (d.user_id = e.user_id)
+  {% endif %}
+  {% if activation %}
+  LEFT JOIN __activationMetric a ON (a.user_id = e.user_id)
+  {% endif %}
+  {% if segment %}
+  WHERE s.date <= CAST(e.timestamp AS DATE)
+  {% endif %}
+  GROUP BY e.user_id
+)
